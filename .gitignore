@@ -1,0 +1,22 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Output data
+output/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
