@@ -135,6 +135,23 @@ def fetch_producers_county(year: int, state: str) -> Optional[pd.DataFrame]:
     return api_get(params)
 
 
+def fetch_farm_operations_county(year: int, state: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch FARM OPERATIONS data at county level for a state+year.
+    This provides total acres operated and number of operations across
+    all producers regardless of race — the denominator for AIAN ratios.
+    """
+    params = {
+        "source_desc": "CENSUS",
+        "year": str(year),
+        "state_alpha": state,
+        "agg_level_desc": "COUNTY",
+        "commodity_desc": "FARM OPERATIONS",
+        "domain_desc": "TOTAL",
+    }
+    return api_get(params)
+
+
 def fetch_producers_state(year: int, state: str) -> Optional[pd.DataFrame]:
     """Fetch state-level producer/operator data (includes more detailed AIAN breakdowns)."""
     params = {
@@ -270,18 +287,42 @@ def infer_total_variable(aian_var: str) -> str:
     return v
 
 
-def build_ratio_dataset(df_aian: pd.DataFrame, df_total: pd.DataFrame) -> pd.DataFrame:
+def build_ratio_dataset(df_aian: pd.DataFrame, df_total: pd.DataFrame,
+                        df_farm_ops: pd.DataFrame = None) -> pd.DataFrame:
     """
     Create a merged dataset matching AIAN values to their corresponding totals
-    to enable AIAN/Total ratio calculation. Automatically maps all AIAN variables
-    to their total counterparts by inferring the naming pattern.
+    to enable AIAN/Total ratio calculation.
+
+    Uses two sources for denominators:
+    - df_total: PRODUCERS commodity data (has NUMBER OF PRODUCERS totals)
+    - df_farm_ops: FARM OPERATIONS commodity data (has ACRES OPERATED and
+      NUMBER OF OPERATIONS totals that don't exist under PRODUCERS)
     """
     if df_aian.empty or df_total.empty:
         return pd.DataFrame()
 
+    # Map FARM OPERATIONS variables to match the AIAN variable naming convention.
+    # AIAN: "PRODUCERS, ... - ACRES OPERATED" needs denominator
+    # FARM OPS has: "FARM OPERATIONS - ACRES OPERATED"
+    farm_ops_mapping = {
+        "FARM OPERATIONS - ACRES OPERATED": "PRODUCERS, (ALL) - ACRES OPERATED",
+        "FARM OPERATIONS - NUMBER OF OPERATIONS": "PRODUCERS, (ALL) - NUMBER OF OPERATIONS",
+    }
+
+    # Combine totals: start with PRODUCERS totals, add FARM OPERATIONS totals
+    combined_total = df_total.copy()
+    if df_farm_ops is not None and not df_farm_ops.empty:
+        farm_subset = df_farm_ops[
+            df_farm_ops["variable_desc"].isin(farm_ops_mapping.keys())
+        ].copy()
+        if not farm_subset.empty:
+            farm_subset["variable_desc"] = farm_subset["variable_desc"].map(farm_ops_mapping)
+            combined_total = pd.concat([combined_total, farm_subset], ignore_index=True)
+            log.info("Added %d FARM OPERATIONS records as total denominators", len(farm_subset))
+
     # Build mapping dynamically from actual AIAN variables present
     aian_vars = df_aian["variable_desc"].unique()
-    total_vars_available = set(df_total["variable_desc"].unique())
+    total_vars_available = set(combined_total["variable_desc"].unique())
 
     aian_to_total = {}
     for av in aian_vars:
@@ -303,7 +344,7 @@ def build_ratio_dataset(df_aian: pd.DataFrame, df_total: pd.DataFrame) -> pd.Dat
     aian_key["total_variable"] = aian_key["variable_desc"].map(aian_to_total)
 
     # Get totals
-    total_subset = df_total[df_total["variable_desc"].isin(aian_to_total.values())].copy()
+    total_subset = combined_total[combined_total["variable_desc"].isin(aian_to_total.values())].copy()
     if total_subset.empty:
         return pd.DataFrame()
 
@@ -341,6 +382,7 @@ def run_pipeline():
 
     all_aian_county = []
     all_total_county = []
+    all_farm_ops_county = []
     all_reservation = []
 
     # --- Phase 1: County-level data ---
@@ -409,6 +451,49 @@ def run_pipeline():
             log.info("  %d: no reservation data", year)
         time.sleep(1)
 
+    # --- Phase 2b: Farm Operations totals (denominators for acres/operations) ---
+    log.info("\n--- PHASE 2b: Farm Operations Totals ---")
+    farm_ops_queries = len(CENSUS_YEARS) * len(STATES)
+    farm_ops_completed = 0
+    farm_ops_failed = []
+
+    for year in CENSUS_YEARS:
+        for state in STATES:
+            farm_ops_completed += 1
+            if farm_ops_completed % 25 == 0:
+                log.info(
+                    "  Progress: %d/%d (%.0f%%) | Farm ops records so far: %d",
+                    farm_ops_completed, farm_ops_queries,
+                    100 * farm_ops_completed / farm_ops_queries,
+                    sum(len(d) for d in all_farm_ops_county),
+                )
+
+            df = fetch_farm_operations_county(year, state)
+            if df is not None:
+                all_farm_ops_county.append(df)
+            else:
+                farm_ops_failed.append((year, state))
+
+            time.sleep(1.2)
+
+    if farm_ops_failed:
+        log.info("Retrying %d failed farm ops queries...", len(farm_ops_failed))
+        time.sleep(5)
+        still_failed = []
+        for year, state in farm_ops_failed:
+            df = fetch_farm_operations_county(year, state)
+            if df is not None:
+                all_farm_ops_county.append(df)
+                log.info("  Retry OK: %s %d", state, year)
+            else:
+                still_failed.append((year, state))
+            time.sleep(1)
+        if still_failed:
+            log.warning("Farm ops still failed after retry: %s", still_failed)
+        log.info("Farm ops queries complete. Failed: %d/%d", len(still_failed), farm_ops_queries)
+    else:
+        log.info("Farm ops queries complete. Failed: 0/%d", farm_ops_queries)
+
     # --- Phase 3: Normalize and save ---
     log.info("\n--- PHASE 3: Normalize and Export ---")
 
@@ -453,10 +538,22 @@ def run_pipeline():
         df_res_norm.to_csv(path, index=False)
         log.info("Reservation: %d records -> %s", len(df_res_norm), path)
 
+    # Farm operations data
+    if all_farm_ops_county:
+        df_farm_ops = pd.concat(all_farm_ops_county, ignore_index=True)
+        df_farm_ops_norm = normalize_columns(df_farm_ops)
+        df_farm_ops_norm["variable_short"] = df_farm_ops_norm["variable_desc"].apply(create_variable_short_name)
+
+        path = os.path.join(OUTPUT_DIR, "farm_operations_county_data.csv")
+        df_farm_ops_norm.to_csv(path, index=False)
+        log.info("Farm operations: %d records -> %s", len(df_farm_ops_norm), path)
+    else:
+        df_farm_ops_norm = pd.DataFrame()
+
     # --- Phase 4: Build combined ratio dataset ---
     log.info("\n--- PHASE 4: AIAN/Total Ratios ---")
     if not df_aian_norm.empty and not df_total_norm.empty:
-        df_combined = build_ratio_dataset(df_aian_norm, df_total_norm)
+        df_combined = build_ratio_dataset(df_aian_norm, df_total_norm, df_farm_ops_norm)
         if not df_combined.empty:
             path = os.path.join(OUTPUT_DIR, "aian_combined_ratios.csv")
             df_combined.to_csv(path, index=False)
