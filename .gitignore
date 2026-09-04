@@ -14,6 +14,9 @@ venv/
 # Output data
 output/
 
+# Cached downloaded PDFs (demographic_profile_extract.py)
+pdf_cache/
+
 # Logs
 *.log
 
