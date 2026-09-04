@@ -372,6 +372,81 @@ def build_ratio_dataset(df_aian: pd.DataFrame, df_total: pd.DataFrame,
     return merged
 
 
+def build_aian_farm_operations(df_aian: pd.DataFrame,
+                               df_total: pd.DataFrame,
+                               df_farm_ops: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Build a focused 'AIAN farm operations' dataset: the operation- and
+    acreage-level variables for AIAN producers, with all-races denominators
+    and AIAN/Total ratios.
+
+    IMPORTANT — faithfulness to the source data:
+    These are NASS-published values, reproduced verbatim. NASS reports up to
+    four producers per operation (2017+), so 'NUMBER OF OPERATIONS' for a race
+    means "operations with AT LEAST ONE producer of that race." An operation
+    with both an AIAN and a non-AIAN producer is counted under BOTH races, so
+    race categories intentionally sum to more than the total farm count.
+    We do NOT deduplicate — NASS does not publish a deduplicated figure, and
+    inventing one would make the data LESS authentic. Instead we expose a
+    `race_concept` column so the two officially-distinct concepts are explicit:
+      - 'AIAN_ALONE'         -> producer reported AIAN only
+      - 'AIAN_ALONE_OR_COMBINED' -> AIAN alone OR combined with other races
+    These two concepts overlap by design and must not be summed together.
+    """
+    if df_aian.empty:
+        return pd.DataFrame()
+
+    # Only operation/acreage measures — the "farm operations" the user wants.
+    op_measures = ("NUMBER OF OPERATIONS", "ACRES OPERATED")
+
+    is_op = df_aian["variable_desc"].str.contains("|".join(op_measures), na=False)
+    # Keep the two top-level race concepts, exclude demographic sub-splits
+    # (sex/age/etc.) so this stays an operations-level file.
+    base_concepts = {
+        "PRODUCERS, AMERICAN INDIAN OR ALASKA NATIVE - NUMBER OF OPERATIONS",
+        "PRODUCERS, AMERICAN INDIAN OR ALASKA NATIVE - ACRES OPERATED",
+        "PRODUCERS, AMERICAN INDIAN OR ALASKA NATIVE, ALONE OR COMBINED WITH OTHER RACES - NUMBER OF OPERATIONS",
+        "PRODUCERS, AMERICAN INDIAN OR ALASKA NATIVE, ALONE OR COMBINED WITH OTHER RACES - ACRES OPERATED",
+    }
+    df_ops = df_aian[is_op & df_aian["variable_desc"].isin(base_concepts)].copy()
+    if df_ops.empty:
+        log.warning("No AIAN operation/acreage variables found for farm operations file")
+        return pd.DataFrame()
+
+    df_ops["race_concept"] = df_ops["variable_desc"].apply(
+        lambda v: "AIAN_ALONE_OR_COMBINED"
+        if "ALONE OR COMBINED" in v else "AIAN_ALONE"
+    )
+    df_ops["measure"] = df_ops["variable_desc"].apply(
+        lambda v: "ACRES_OPERATED" if "ACRES OPERATED" in v else "NUMBER_OF_OPERATIONS"
+    )
+
+    # Attach all-races denominators (from FARM OPERATIONS commodity, which is
+    # never broken out by race) so ratios are available.
+    combined_total = df_total.copy() if df_total is not None else pd.DataFrame()
+    if df_farm_ops is not None and not df_farm_ops.empty:
+        farm_ops_mapping = {
+            "FARM OPERATIONS - ACRES OPERATED": "ACRES_OPERATED",
+            "FARM OPERATIONS - NUMBER OF OPERATIONS": "NUMBER_OF_OPERATIONS",
+        }
+        farm_subset = df_farm_ops[
+            df_farm_ops["variable_desc"].isin(farm_ops_mapping.keys())
+        ].copy()
+        if not farm_subset.empty:
+            farm_subset["measure"] = farm_subset["variable_desc"].map(farm_ops_mapping)
+            geo_keys = [k for k in ["state", "county", "year"]
+                        if k in df_ops.columns and k in farm_subset.columns]
+            denom = farm_subset[geo_keys + ["measure", "value_numeric"]].rename(
+                columns={"value_numeric": "total_value"}
+            )
+            df_ops = df_ops.merge(denom, on=geo_keys + ["measure"], how="left")
+            df_ops["aian_ratio"] = (
+                df_ops["value_numeric"] / df_ops["total_value"]
+            ).round(4)
+
+    return df_ops
+
+
 def run_pipeline():
     """Main extraction pipeline."""
     log.info("=" * 60)
@@ -562,6 +637,21 @@ def run_pipeline():
                      df_combined[df_combined["variable_desc"].str.contains("NUMBER OF PRODUCERS")]["aian_ratio"].mean())
         else:
             log.info("Could not compute ratios (no matching variables)")
+
+    # --- Phase 4b: AIAN farm operations (operations + acres) ---
+    log.info("\n--- PHASE 4b: AIAN Farm Operations ---")
+    if not df_aian_norm.empty:
+        df_aian_farm_ops = build_aian_farm_operations(
+            df_aian_norm, df_total_norm, df_farm_ops_norm
+        )
+        if not df_aian_farm_ops.empty:
+            path = os.path.join(OUTPUT_DIR, "aian_farm_operations.csv")
+            df_aian_farm_ops.to_csv(path, index=False)
+            log.info("AIAN farm operations: %d records -> %s", len(df_aian_farm_ops), path)
+            log.info("  Race concepts (overlap by design, do NOT sum): %s",
+                     sorted(df_aian_farm_ops["race_concept"].unique()))
+        else:
+            log.info("No AIAN farm operations records produced")
 
     # --- Summary ---
     log.info("\n" + "=" * 60)
